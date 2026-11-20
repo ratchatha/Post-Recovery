@@ -29,6 +29,78 @@ function Get-Installed {
     return $script:InstalledCache
 }
 
+function Open-IntelDsa {
+    $lnk = Get-ChildItem "$env:ProgramData\Microsoft\Windows\Start Menu\Programs" -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match 'Intel.*Driver.*Support' } | Select-Object -First 1
+    if ($lnk) { Start-Process $lnk.FullName; return }
+    $exe = Join-Path ${env:ProgramFiles(x86)} 'Intel\Driver and Support Assistant\DSATray.exe'
+    if (Test-Path $exe) { Start-Process $exe; return }
+    Start-Process 'https://www.intel.com/content/www/us/en/support/detect.html'
+}
+
+function Get-CurrentLangId {
+    $h = [PRC.Kbd]::GetForegroundWindow()
+    [uint32]$procId = 0
+    $t = [PRC.Kbd]::GetWindowThreadProcessId($h, [ref]$procId)
+    $kl = [PRC.Kbd]::GetKeyboardLayout($t)
+    return ([int64]$kl -band 0xFFFF)
+}
+
+function Test-TildeSwitch {
+    $auto = $false
+    try {
+        if (-not ('PRC.Kbd' -as [type])) {
+            Add-Type -Namespace PRC -Name Kbd -MemberDefinition @'
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+[DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint idThread);
+'@
+        }
+        $before = Get-CurrentLangId
+        Write-Host ("     Current input language ID: 0x{0:X4}  (0x041E = Thai, 0x0409 = English US)" -f $before)
+        [void](Read-Host "  Press the ~ (tilde / grave accent) key ONCE, then press Enter")
+        $after = Get-CurrentLangId
+        Write-Host ("     Input language ID after pressing ~: 0x{0:X4}" -f $after)
+        if ($after -ne $before) {
+            $auto = $true
+            Add-Result 3 'OK' 'The ~ key switches the input language'
+            [void](Read-Host "  Press ~ once more to switch back, then press Enter")
+        }
+    } catch { }
+    if (-not $auto) {
+        Write-Host "     Could not detect a change automatically. Check the language indicator in the taskbar." -ForegroundColor Gray
+        if (Confirm-Yes "Did the language switch (Thai <-> English) when you pressed the ~ key?") {
+            Add-Result 3 'OK' 'The ~ key switches the input language (confirmed manually)'
+            [void](Read-Host "  Press ~ once more to switch back, then press Enter")
+        } else {
+            Add-Result 3 'FAIL' 'The ~ key does NOT switch the input language (check Settings > Time & language > Typing > Advanced keyboard settings)'
+        }
+    }
+}
+
+function Show-RecoveryKey($mp) {
+    $v = Get-BitLockerVolume -MountPoint $mp
+    $rp = @($v.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+    if ($rp.Count -eq 0) {
+        Write-Host "  No recovery key exists for $mp." -ForegroundColor Yellow
+        if (Confirm-Yes "Create a new recovery key for $mp (this adds a key protector to the drive)?") {
+            Add-BitLockerKeyProtector -MountPoint $mp -RecoveryPasswordProtector | Out-Null
+            $v = Get-BitLockerVolume -MountPoint $mp
+            $rp = @($v.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })
+        }
+    }
+    foreach ($p in $rp) {
+        Write-Host ""
+        Write-Host "  ---- BitLocker recovery key for $mp (displayed only, NOT saved) ----" -ForegroundColor Yellow
+        Write-Host "  Key ID       : $($p.KeyProtectorId)"
+        Write-Host "  Recovery key : $($p.RecoveryPassword)" -ForegroundColor Yellow
+    }
+    if ($rp.Count -gt 0) {
+        Add-Result 7 'OK' "Recovery key for $mp displayed on screen (not saved to any file or to the report)"
+        [void](Read-Host "  Copy the key now, then press Enter to continue")
+    }
+}
+
 # ---------------------------------------------------------------- 1
 function Step1 {
     Title "1. Windows Update / Intel Driver Support"
@@ -65,10 +137,8 @@ function Step1 {
 
     $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Manufacturer
     if ($cpu -match 'Intel') {
-        $dsa = Get-Installed | Where-Object { $_.DisplayName -match 'Intel.*Driver.*Support' }
-        if ($dsa) {
-            Add-Result 1 'OK' 'Intel Driver & Support Assistant is installed'
-        } else {
+        $dsa = Get-Installed | Where-Object { $_.DisplayName -match 'Intel.*Driver.*Support' } | Select-Object -First 1
+        if (-not $dsa) {
             Add-Result 1 'WARN' 'Intel Driver & Support Assistant not found'
             if (Confirm-Yes "Install it (winget) or open the download page?") {
                 if (Test-Winget) {
@@ -76,6 +146,20 @@ function Step1 {
                 } else {
                     Start-Process 'https://www.intel.com/content/www/us/en/support/detect.html'
                 }
+            }
+        } else {
+            Add-Result 1 'OK' ("Intel DSA installed: {0} {1}" -f $dsa.DisplayName, $dsa.DisplayVersion)
+            if (Test-Winget) {
+                Write-Host "  Checking whether the DSA application itself has an update (winget)..."
+                winget upgrade --id Intel.IntelDriverAndSupportAssistant -e --accept-source-agreements
+            }
+            Write-Host "  Intel DSA has no command-line interface, so its driver list can only be read on screen." -ForegroundColor Gray
+            Write-Host "  Opening Intel DSA. Wait for its scan to finish, then read the result." -ForegroundColor Gray
+            Open-IntelDsa
+            if (Confirm-Yes "Does Intel DSA list any driver updates? (Y = updates available, N = none)") {
+                Add-Result 1 'WARN' 'Intel DSA reports driver updates available; install them from DSA'
+            } else {
+                Add-Result 1 'OK' 'Intel DSA reports no driver updates'
             }
         }
     } else {
@@ -138,9 +222,11 @@ function Step3 {
     $snd = Get-CimInstance Win32_SoundDevice
     if ($snd) {
         foreach ($s in $snd) { Write-Host ("     Audio: {0} ({1})" -f $s.Name, $s.Status) }
-        [System.Media.SystemSounds]::Exclamation.Play(); Start-Sleep -Seconds 1
-        if (Confirm-Yes "Did you hear the test sound from the speakers?") { Add-Result 3 'OK' 'Speakers working' }
-        else { Add-Result 3 'FAIL' 'No sound from speakers (check volume / mute / driver)' }
+        Write-Host "     Opening the Windows Sound dialog. Go to Playback > select Speakers > Configure > Test" -ForegroundColor Gray
+        Write-Host "     (or Properties > Advanced > Test) and listen for the Windows test sound." -ForegroundColor Gray
+        Start-Process control.exe -ArgumentList 'mmsys.cpl'
+        if (Confirm-Yes "Did you hear the Windows test sound from the speakers?") { Add-Result 3 'OK' 'Speakers working (Windows sound test)' }
+        else { Add-Result 3 'FAIL' 'No sound from speakers in the Windows sound test (check volume / mute / driver)' }
     } else {
         Add-Result 3 'FAIL' 'No audio device found'
     }
@@ -167,7 +253,8 @@ function Step3 {
     $tags = $langs | ForEach-Object { $_.LanguageTag }
     Write-Host ("     Keyboard languages: " + ($tags -join ', '))
     if ($tags -contains 'th-TH' -and ($tags | Where-Object { $_ -like 'en-*' })) {
-        Add-Result 3 'OK' 'Thai and English present (test the switch key: ~ or Alt+Shift)'
+        Add-Result 3 'OK' 'Thai and English keyboard layouts are installed'
+        Test-TildeSwitch
     } else {
         Add-Result 3 'WARN' 'Thai or English is missing from the language list'
         if (-not ($tags -contains 'th-TH') -and (Confirm-Yes "Add Thai (th-TH)?")) {
@@ -199,34 +286,46 @@ function Step4 {
 
 # ---------------------------------------------------------------- 5
 function Step5 {
-    Title "5. Drive partitions"
+    Title "5. Drive partitions (unallocated space -> new drive; C: is never modified)"
     Get-Volume | Where-Object { $_.DriveLetter } | Sort-Object DriveLetter | ForEach-Object {
         Write-Host ("     {0}: {1,-14} total {2,8:N1} GB / free {3,8:N1} GB ({4})" -f $_.DriveLetter, $_.FileSystemLabel, ($_.Size / 1GB), ($_.SizeRemaining / 1GB), $_.FileSystem)
     }
     $others = Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' -and $_.DriveLetter -ne 'C' }
     if ($others) { Add-Result 5 'OK' ("Separate data drive already exists: " + (($others | ForEach-Object { $_.DriveLetter }) -join ', ')); return }
 
-    Add-Result 5 'WARN' 'Only drive C: exists; disk not partitioned yet'
-    if (-not (Confirm-Yes "Create a separate data drive from C: now?")) { return }
+    $part = Get-Partition -DriveLetter C -ErrorAction SilentlyContinue
+    if (-not $part) { Add-Result 5 'INFO' 'Could not find the disk that holds C:; step skipped'; return }
+    $diskNum = $part.DiskNumber
+    $disk = Get-Disk -Number $diskNum
 
-    $sup = Get-PartitionSupportedSize -DriveLetter C
-    $curGB = [math]::Floor($sup.SizeMax / 1GB)
-    $minGB = [math]::Ceiling($sup.SizeMin / 1GB)
-    Write-Host "     C: is currently $curGB GB, can shrink to about $minGB GB"
-    $in = Read-Host "  How many GB should C: keep (e.g. 200)"
-    [int]$cGB = 0
-    if (-not [int]::TryParse($in, [ref]$cGB) -or $cGB -lt $minGB -or $cGB -ge $curGB) {
-        Add-Result 5 'FAIL' "Invalid size (must be between $minGB and $curGB GB)"; return
+    $freeBytes = [int64]0
+    if ($disk.PSObject.Properties['LargestFreeExtent']) {
+        $freeBytes = [int64]$disk.LargestFreeExtent
+    } else {
+        $used = (Get-Partition -DiskNumber $diskNum | Measure-Object -Property Size -Sum).Sum
+        $freeBytes = [int64]($disk.Size - $used)
     }
+    Write-Host ("     Disk {0}: size {1:N1} GB, unallocated space {2:N1} GB" -f $diskNum, ($disk.Size / 1GB), ($freeBytes / 1GB))
+
+    if ($freeBytes -lt 1GB) {
+        Add-Result 5 'INFO' 'No unallocated space on the system disk; step skipped (C: was not touched)'
+        return
+    }
+    Add-Result 5 'WARN' ("Unallocated space found: {0:N1} GB" -f ($freeBytes / 1GB))
+    if (-not (Confirm-Yes "Create drive D: from this unallocated space? (C: will NOT be changed)")) { return }
     $label = Read-Host "  New drive label (Enter = Data)"
     if (-not $label) { $label = 'Data' }
-    if (-not (Confirm-Yes "Confirm: shrink C: to $cGB GB and create drive '$label' from the remaining space?")) { return }
+
+    $dTaken = [bool](Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='D:'")
     try {
-        Resize-Partition -DriveLetter C -Size ([int64]$cGB * 1GB) -ErrorAction Stop
-        $diskNum = (Get-Partition -DriveLetter C).DiskNumber
-        $np = New-Partition -DiskNumber $diskNum -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
+        if ($dTaken) {
+            Write-Host "  Drive letter D: is already used by another device; the next free letter will be used." -ForegroundColor Yellow
+            $np = New-Partition -DiskNumber $diskNum -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
+        } else {
+            $np = New-Partition -DiskNumber $diskNum -UseMaximumSize -DriveLetter D -ErrorAction Stop
+        }
         Format-Volume -Partition $np -FileSystem NTFS -NewFileSystemLabel $label -Confirm:$false | Out-Null
-        Add-Result 5 'OK' ("Created drive {0}: ({1})" -f $np.DriveLetter, $label)
+        Add-Result 5 'OK' ("Created drive {0}: ({1}) from unallocated space; C: untouched" -f $np.DriveLetter, $label)
     } catch { Add-Result 5 'FAIL' ("Partitioning failed: " + $_.Exception.Message) }
 }
 
@@ -275,15 +374,21 @@ function Step7 {
         $vols = Get-BitLockerVolume -ErrorAction Stop
         foreach ($v in $vols) {
             $line = "{0} Protection={1} Status={2} Encrypted={3}%" -f $v.MountPoint, $v.ProtectionStatus, $v.VolumeStatus, $v.EncryptionPercentage
-            if ($v.ProtectionStatus -eq 'On' -or $v.VolumeStatus -ne 'FullyDecrypted') { Add-Result 7 'FAIL' ("BitLocker is ON / encrypting: " + $line) }
-            else { Add-Result 7 'OK' ("BitLocker is OFF: " + $line) }
+            if ($v.ProtectionStatus -eq 'On' -or $v.VolumeStatus -ne 'FullyDecrypted') {
+                Add-Result 7 'FAIL' ("BitLocker is ON / encrypting: " + $line)
+                Show-RecoveryKey $v.MountPoint
+            } else {
+                Add-Result 7 'OK' ("BitLocker is OFF: " + $line)
+            }
         }
     } catch {
         Write-Host "  Using manage-bde instead (Get-BitLockerVolume unavailable on this PC)" -ForegroundColor Gray
         manage-bde -status
-        Add-Result 7 'INFO' 'See manage-bde output above'
+        Write-Host "  Recovery key (displayed only, NOT saved):" -ForegroundColor Yellow
+        manage-bde -protectors -get $env:SystemDrive
+        Add-Result 7 'INFO' 'See manage-bde output above (recovery key not saved)'
     }
-    if (Confirm-Yes "Open BitLocker Drive Encryption (Control Panel) to check visually?") {
+    if (Confirm-Yes "Open BitLocker Drive Encryption (Control Panel) to check / back up visually?") {
         Start-Process control.exe -ArgumentList '/name Microsoft.BitLockerDriveEncryption'
     }
 }
